@@ -41,6 +41,21 @@ class BacktestResult:
     trading_days: int = 0
     annual_return: float = 0.0
     annual_vol: float = 0.0
+    # Advanced ratios
+    sortino: float = 0.0
+    information_ratio: float = 0.0
+    treynor_ratio: float = 0.0
+    sterling_ratio: float = 0.0
+    burke_ratio: float = 0.0
+    expectancy: float = 0.0
+    omega_ratio: float = 0.0
+    tail_ratio: float = 0.0
+    up_capture: float = 0.0
+    down_capture: float = 0.0
+    capture_ratio: float = 0.0
+    ulcer_index: float = 0.0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -62,7 +77,8 @@ class Backtester:
         -------
         BacktestResult with all metrics and enriched OOS DataFrame
         """
-        print("\n  ── Backtesting ──────────────────────────────────────────")
+        print("\n  -- Backtesting ------------------------------------------------------")
+        print("     (Simulating: 'If I had followed these signals in the past, how would I have done?')")
 
         # Filter to out-of-sample period (where we have signals)
         has_signal = strategy_df['Probability'].notna() if 'Probability' in strategy_df.columns \
@@ -70,10 +86,10 @@ class Backtester:
         oos = strategy_df[has_signal].copy()
 
         if len(oos) == 0:
-            print("    ⚠ No OOS data to backtest")
+            print("    [WARN] No OOS data to backtest")
             return BacktestResult(oos_df=oos)
 
-        # ── Returns ──────────────────────────────────────────────────────
+        # ── Returns ──────────────────────────────────────────────────
         oos['Daily_Return']      = oos[price_col].pct_change()
         oos['Strategy_Return']   = oos['Signal'].shift(1) * oos['Daily_Return']
         oos['Strategy_Return']   = oos['Strategy_Return'].fillna(0)
@@ -81,21 +97,24 @@ class Backtester:
         oos['Strategy_Cumulative'] = (1 + oos['Strategy_Return']).cumprod()
         oos['BnH_Cumulative']      = (1 + oos['BnH_Return']).cumprod()
 
-        # ── Drawdown ─────────────────────────────────────────────────────
+        # ── Drawdown ─────────────────────────────────────────────────
         cum_max = oos['Strategy_Cumulative'].cummax()
         oos['Drawdown'] = (oos['Strategy_Cumulative'] - cum_max) / cum_max
 
-        # ── Rolling Sharpe ───────────────────────────────────────────────
+        # ── Rolling Sharpe ───────────────────────────────────────────
         oos['Rolling_Sharpe'] = (
             oos['Strategy_Return'].rolling(60).mean() /
             (oos['Strategy_Return'].rolling(60).std() + 1e-8)
         ) * np.sqrt(252)
 
-        # ── Monthly Returns ──────────────────────────────────────────────
+        # ── Monthly Returns ─────────────────────────────────────────
         oos['YearMonth'] = oos.index.to_period('M')
 
-        # ── Metrics ──────────────────────────────────────────────────────
+        # ═════════════════════════════════════════════════════════════
+        # CORE METRICS
+        # ═════════════════════════════════════════════════════════════
         strat_ret   = oos['Strategy_Return']
+        bnh_daily   = oos['BnH_Return']
         total_ret   = oos['Strategy_Cumulative'].iloc[-1] - 1
         bnh_ret     = oos['BnH_Cumulative'].iloc[-1] - 1
         sharpe      = (strat_ret.mean() / (strat_ret.std() + 1e-8)) * np.sqrt(252)
@@ -110,6 +129,74 @@ class Backtester:
         annual_vol  = strat_ret.std() * np.sqrt(252)
         calmar      = annual_ret / abs(max_dd) if max_dd != 0 else np.inf
 
+        # ═════════════════════════════════════════════════════════════
+        # ADVANCED RATIOS
+        # ═════════════════════════════════════════════════════════════
+
+        # 1. Sortino Ratio -- only penalizes downside volatility
+        downside = strat_ret[strat_ret < 0]
+        downside_std = downside.std() if len(downside) > 0 else 1e-8
+        sortino = (strat_ret.mean() / (downside_std + 1e-8)) * np.sqrt(252)
+
+        # 2. Information Ratio -- skill vs benchmark
+        excess = strat_ret - bnh_daily
+        tracking_error = excess.std() + 1e-8
+        information_ratio = (excess.mean() / tracking_error) * np.sqrt(252)
+
+        # 3. Treynor Ratio -- return per unit of systematic risk
+        cov_matrix = np.cov(strat_ret.dropna().values, bnh_daily.dropna().values)
+        beta = cov_matrix[0, 1] / (cov_matrix[1, 1] + 1e-8)
+        treynor = annual_ret / (beta + 1e-8) if beta != 0 else np.inf
+
+        # 4. Sterling Ratio -- return / average of top 3 drawdowns
+        dd_series = oos['Drawdown']
+        dd_periods = []
+        in_dd = False
+        current_dd = 0
+        for dd_val in dd_series:
+            if dd_val < 0:
+                in_dd = True
+                current_dd = min(current_dd, dd_val)
+            elif in_dd:
+                dd_periods.append(current_dd)
+                current_dd = 0
+                in_dd = False
+        if in_dd:
+            dd_periods.append(current_dd)
+        top3_dd = sorted(dd_periods)[:3] if len(dd_periods) >= 3 else dd_periods
+        avg_top3 = abs(np.mean(top3_dd)) if top3_dd else 1e-8
+        sterling = annual_ret / avg_top3 if avg_top3 > 0 else np.inf
+
+        # 5. Burke Ratio -- return / sqrt(sum of squared drawdowns)
+        squared_dd_sum = sum(d ** 2 for d in dd_periods) if dd_periods else 1e-8
+        burke = annual_ret / (np.sqrt(squared_dd_sum) + 1e-8)
+
+        # 6. Expectancy -- expected $ per trade
+        avg_win = trades[trades > 0].mean() if (trades > 0).any() else 0
+        avg_loss = abs(trades[trades < 0].mean()) if (trades < 0).any() else 0
+        loss_rate = 1 - win_rate
+        expectancy = (win_rate * avg_win) - (loss_rate * avg_loss)
+
+        # 7. Omega Ratio -- probability-weighted gains vs losses at threshold=0
+        gains = strat_ret[strat_ret > 0].sum()
+        losses = abs(strat_ret[strat_ret < 0].sum())
+        omega = (gains / losses) if losses > 0 else np.inf
+
+        # 8. Tail Ratio -- are big wins bigger than big losses?
+        p95 = strat_ret.quantile(0.95)
+        p05 = abs(strat_ret.quantile(0.05))
+        tail = p95 / p05 if p05 > 0 else np.inf
+
+        # 9. Up/Down Capture Ratios
+        up_days = bnh_daily > 0
+        dn_days = bnh_daily < 0
+        up_capture = (strat_ret[up_days].mean() / bnh_daily[up_days].mean()) if up_days.sum() > 0 else 0
+        down_capture = (strat_ret[dn_days].mean() / bnh_daily[dn_days].mean()) if dn_days.sum() > 0 else 0
+        capture_ratio = up_capture / down_capture if down_capture != 0 else np.inf
+
+        # 10. Ulcer Index -- depth & duration of drawdowns
+        ulcer = np.sqrt((dd_series ** 2).mean()) * 100
+
         result = BacktestResult(
             oos_df=oos,
             total_return=total_ret,
@@ -123,24 +210,136 @@ class Backtester:
             trading_days=len(strat_ret),
             annual_return=annual_ret,
             annual_vol=annual_vol,
+            sortino=sortino,
+            information_ratio=information_ratio,
+            treynor_ratio=treynor,
+            sterling_ratio=sterling,
+            burke_ratio=burke,
+            expectancy=expectancy,
+            omega_ratio=omega,
+            tail_ratio=tail,
+            up_capture=up_capture,
+            down_capture=down_capture,
+            capture_ratio=capture_ratio,
+            ulcer_index=ulcer,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
         )
 
-        # ── Print Summary ────────────────────────────────────────────────
-        print("  ┌─────────────────────────────────────────────────────┐")
-        print("  │           STRATEGY PERFORMANCE SUMMARY              │")
-        print("  ├─────────────────────────────────────────────────────┤")
-        print(f"  │  Total Strategy Return       {total_ret*100:>+10.2f}%             │")
-        print(f"  │  Total Buy&Hold Return       {bnh_ret*100:>+10.2f}%             │")
-        print(f"  │  Annualized Sharpe           {sharpe:>10.3f}              │")
-        print(f"  │  Annualized Return           {annual_ret*100:>+10.2f}%             │")
-        print(f"  │  Annualized Volatility       {annual_vol*100:>10.2f}%             │")
-        print(f"  │  Max Drawdown                {max_dd*100:>10.2f}%             │")
-        print(f"  │  Win Rate                    {win_rate*100:>10.1f}%             │")
-        print(f"  │  Profit Factor               {pf:>10.2f}              │")
-        print(f"  │  Calmar Ratio                {calmar:>10.2f}              │")
-        print(f"  │  Trading Days                {len(strat_ret):>10d}              │")
-        print(f"  │  Total Trades                {len(trades):>10d}              │")
-        print("  └─────────────────────────────────────────────────────┘")
+        # ═════════════════════════════════════════════════════════════
+        # PRETTY PRINT — CATEGORIZED PERFORMANCE REPORT
+        # ═════════════════════════════════════════════════════════════
+        def _grade(val, thresholds, reverse=False):
+            """Return a letter grade based on thresholds: (excellent, good, fair)."""
+            a, b, c = thresholds
+            if reverse:
+                if val <= a: return '[A+]'
+                if val <= b: return '[B ]'
+                if val <= c: return '[C ]'
+                return '[D-]'
+            else:
+                if val >= a: return '[A+]'
+                if val >= b: return '[B ]'
+                if val >= c: return '[C ]'
+                return '[D-]'
+
+        W = 88  # total box width
+        HR = '-' * W  # horizontal rule
+        print()
+        print(f"  +{HR}+")
+        print(f"  |{'PETROQUANT -- STRATEGY PERFORMANCE REPORT':^{W}}|")
+        print(f"  |{HR}|")
+        print(f"  |{'(How well did the strategy perform if we had traded it in the past?)':^{W}}|")
+        print(f"  +{HR}+")
+
+        # ---- THE BASICS ----
+        print(f"  |{'':^{W}}|")
+        print(f"  |  >> THE BASICS (Return & Activity){'':>{W-37}}|")
+        print(f"  |{HR}|")
+        _p = lambda label, val, desc, grade='': print(
+            f"  |  {label:<28} {val:>12}   {grade:<6} {desc:<{W-52}}|"
+        )
+        _p('Total Strategy Return', f'{total_ret*100:+.2f}%',
+           'Total profit if you followed every signal', _grade(total_ret*100, (50, 20, 0)))
+        _p('Buy & Hold Return', f'{bnh_ret*100:+.2f}%',
+           'What you\'d earn just holding oil (the benchmark)', '')
+        _p('Alpha (Strategy - B&H)', f'{(total_ret-bnh_ret)*100:+.2f}%',
+           'Extra return the strategy generated over passive holding',
+           _grade((total_ret-bnh_ret)*100, (30, 10, 0)))
+        _p('Annualized Return', f'{annual_ret*100:+.2f}%',
+           'Average yearly return, compounded', _grade(annual_ret*100, (20, 10, 0)))
+        _p('Annualized Volatility', f'{annual_vol*100:.2f}%',
+           'How much the returns swing per year (lower = smoother)', _grade(annual_vol*100, (15, 25, 35), reverse=True))
+        _p('Trading Days', f'{len(strat_ret):,}',
+           'Total calendar days in the backtest', '')
+        _p('Total Trades', f'{len(trades):,}',
+           'Days where we were actively long or short', '')
+
+        # ---- RISK-ADJUSTED ----
+        print(f"  |{'':^{W}}|")
+        print(f"  |  >> RISK-ADJUSTED RATIOS (Return normalised by risk taken){'':>{W-59}}|")
+        print(f"  |{HR}|")
+        _p('Sharpe Ratio', f'{sharpe:.3f}',
+           'Return / total volatility (>= 1.0 is good)', _grade(sharpe, (1.5, 1.0, 0.5)))
+        _p('Sortino Ratio', f'{sortino:.3f}',
+           'Like Sharpe, but only counts DOWNSIDE swings (>= 1.5 ideal)', _grade(sortino, (2.0, 1.0, 0.5)))
+        _p('Information Ratio', f'{information_ratio:.3f}',
+           'Your skill vs benchmark -- excess return / tracking error', _grade(information_ratio, (1.0, 0.5, 0.0)))
+        _p('Treynor Ratio', f'{treynor:.3f}',
+           'Return / market risk (beta) -- rewards low-beta strategies', _grade(treynor, (0.3, 0.15, 0.0)))
+        _p('Omega Ratio', f'{omega:.3f}',
+           'Total gains / total losses (>= 1.5 = strong edge)', _grade(omega, (1.5, 1.2, 1.0)))
+
+        # ---- PAIN & RECOVERY ----
+        print(f"  |{'':^{W}}|")
+        print(f"  |  >> PAIN & RECOVERY (Drawdown-based -- 'can I stomach this?'){'':>{W-62}}|")
+        print(f"  |{HR}|")
+        _p('Max Drawdown', f'{max_dd*100:.2f}%',
+           'Worst peak-to-trough drop (>=-20% is acceptable)', _grade(abs(max_dd*100), (10, 20, 30), reverse=True))
+        _p('Calmar Ratio', f'{calmar:.3f}',
+           'Annual return / max drawdown (>= 1.0 = good recovery)', _grade(calmar, (2.0, 1.0, 0.5)))
+        _p('Sterling Ratio', f'{sterling:.3f}',
+           'Annual return / avg of top 3 drawdowns (more stable)', _grade(sterling, (2.0, 1.0, 0.5)))
+        _p('Burke Ratio', f'{burke:.3f}',
+           'Penalises frequent deep drops more heavily', _grade(burke, (1.0, 0.5, 0.2)))
+        _p('Ulcer Index', f'{ulcer:.2f}',
+           'Depth + duration of drawdowns (lower = less stress)', _grade(ulcer, (5, 10, 20), reverse=True))
+
+        # ---- TRADE EFFICIENCY ----
+        print(f"  |{'':^{W}}|")
+        print(f"  |  >> TRADE EFFICIENCY (The math of each individual trade){'':>{W-58}}|")
+        print(f"  |{HR}|")
+        _p('Win Rate', f'{win_rate*100:.1f}%',
+           'Percentage of trades that made money (>= 50% needed)',
+           _grade(win_rate*100, (55, 50, 45)))
+        _p('Profit Factor', f'{pf:.3f}',
+           'Gross profit / gross loss (>= 1.5 = robust edge)', _grade(pf, (1.5, 1.2, 1.0)))
+        _p('Expectancy', f'{expectancy*10000:.2f} bps',
+           'Expected profit per trade in basis points (> 0 = profitable)', _grade(expectancy*10000, (5, 2, 0)))
+        _p('Avg Win', f'{avg_win*10000:.2f} bps',
+           'Average gain on winning trades (in basis points)', '')
+        _p('Avg Loss', f'{avg_loss*10000:.2f} bps',
+           'Average loss on losing trades (in basis points)', '')
+        _p('Tail Ratio', f'{tail:.3f}',
+           'Big wins / big losses (>= 1.0 = your best days > worst)', _grade(tail, (1.2, 1.0, 0.8)))
+
+        # ---- MARKET SKILL ----
+        print(f"  |{'':^{W}}|")
+        print(f"  |  >> MARKET SKILL (How well do you capture gains & dodge losses?){'':>{W-65}}|")
+        print(f"  |{HR}|")
+        _p('Up-Market Capture', f'{up_capture*100:.1f}%',
+           'How much of bull-day gains you captured (>= 100% = full)', _grade(up_capture*100, (100, 70, 50)))
+        _p('Down-Market Capture', f'{down_capture*100:.1f}%',
+           'How much of bear-day pain you absorbed (<= 50% = great)', _grade(down_capture*100, (30, 50, 80), reverse=True))
+        _p('Capture Ratio', f'{capture_ratio:.3f}',
+           'Up / Down capture (>= 1.5 = skilful market timing)', _grade(capture_ratio, (2.0, 1.5, 1.0)))
+
+        print(f"  |{'':^{W}}|")
+        print(f"  +{HR}+")
+
+        # Legend
+        print(f"\n  * Grades: [A+] = Excellent | [B ] = Good | [C ] = Fair | [D-] = Needs Work")
+        print(f"    bps = basis points (100 bps = 1%). Example: 5 bps per trade means $5 profit per $10,000 traded.")
 
         return result
 
@@ -200,16 +399,16 @@ class StrategyDashboard:
         fig = make_subplots(
             rows=5, cols=2,
             subplot_titles=(
-                '① Price + Regime Shading',
-                '② Buy/Sell Signal Overlay',
-                '③ Equity Curve: Strategy vs Buy & Hold',
-                '④ Drawdown (Underwater Plot)',
-                '⑤ Feature Importance (Top 15)',
-                '⑥ Accuracy per Regime',
-                '⑦ Rolling 60-Day Sharpe Ratio',
-                '⑧ Monthly Returns Heatmap',
-                '⑨ Return Forecast (Multi-Horizon)',
-                '⑩ Performance Summary',
+                '(1) Price + Regime Shading',
+                '(2) Buy/Sell Signal Overlay',
+                '(3) Equity Curve: Strategy vs Buy & Hold',
+                '(4) Drawdown (Underwater Plot)',
+                '(5) Feature Importance (Top 15)',
+                '(6) Accuracy per Regime',
+                '(7) Rolling 60-Day Sharpe Ratio',
+                '(8) Monthly Returns Heatmap',
+                '(9) WTI Price Forecast with 95% Volatility CI',
+                '(10) Performance Summary',
             ),
             vertical_spacing=0.055,
             horizontal_spacing=0.08,
@@ -351,88 +550,170 @@ class StrategyDashboard:
                 hovertemplate='%{y} %{x}: %{z:.2f}%<extra></extra>',
             ), row=4, col=2)
 
-        # ── Panel 9: Return Forecast (Multi-Horizon) ─────────────────────
+        # ── Panel 9: WTI Price Forecast with Volatility CI ──────────────
         if forecasts:
             horizons = sorted(forecasts.keys())
-            prob_ups = [forecasts[h]['prob_up'] for h in horizons]
-            exp_rets = [forecasts[h]['expected_return'] * 100 for h in horizons]
-            labels   = [f"{h}d" for h in horizons]
-            bar_colors = [COLORS['green'] if p > 0.5 else COLORS['red'] for p in prob_ups]
+            exp_prices = [forecasts[h]['expected_price'] for h in horizons]
+            exp_rets   = [forecasts[h]['expected_return'] * 100 for h in horizons]
+            prob_ups   = [forecasts[h]['prob_up'] for h in horizons]
+            current_price = forecasts[horizons[0]].get('current_price', 0)
+            labels     = [f"{h}d" for h in horizons]
 
-            # Expected return bars
+            # CI bounds
+            price_lows  = [forecasts[h].get('price_low', exp_prices[i]) for i, h in enumerate(horizons)]
+            price_highs = [forecasts[h].get('price_high', exp_prices[i]) for i, h in enumerate(horizons)]
+
+            # Volatility info for hover
+            vol_composites = [forecasts[h].get('vol_composite', 0) for h in horizons]
+            vol_garchs = [forecasts[h].get('vol_garch', 0) for h in horizons]
+            vol_atrs = [forecasts[h].get('vol_atr', 0) for h in horizons]
+            vol_ivs = [forecasts[h].get('vol_iv', 0) or 0 for h in horizons]
+
+            # CI width relative to price determines bar color
+            ci_widths = [(price_highs[i] - price_lows[i]) / current_price if current_price > 0 else 0
+                         for i in range(len(horizons))]
+            bar_colors = []
+            for i, w in enumerate(ci_widths):
+                if prob_ups[i] > 0.55:
+                    bar_colors.append(COLORS['green'])
+                elif prob_ups[i] < 0.45:
+                    bar_colors.append(COLORS['red'])
+                else:
+                    bar_colors.append(COLORS['amber'])
+
+            # Error bars for CI
+            error_low  = [exp_prices[i] - price_lows[i] for i in range(len(horizons))]
+            error_high = [price_highs[i] - exp_prices[i] for i in range(len(horizons))]
+
             fig.add_trace(go.Bar(
-                x=labels, y=exp_rets,
+                x=labels, y=exp_prices,
                 marker_color=bar_colors,
-                text=[f"{r:+.2f}%<br>P(↑)={p:.0%}" for r, p in zip(exp_rets, prob_ups)],
-                textposition='auto', showlegend=False,
-                name='Expected Return',
+                error_y=dict(
+                    type='data',
+                    symmetric=False,
+                    array=error_high,
+                    arrayminus=error_low,
+                    color=COLORS['white'],
+                    thickness=1.5,
+                    width=6,
+                ),
+                text=[f"${p:.2f}" for p in exp_prices],
+                textposition='outside', showlegend=False,
+                name='Expected Price',
+                hovertemplate=(
+                    '<b>%{x} Forecast</b><br>'
+                    'Expected: $%{y:.2f}<br>'
+                    'Range: $%{customdata[0]:.2f} - $%{customdata[1]:.2f}<br>'
+                    'Return: %{customdata[2]:+.2f}%<br>'
+                    'P(Up): %{customdata[3]:.0%}<br>'
+                    'Vol: GARCH %{customdata[4]:.1f}% / ATR %{customdata[5]:.1f}% / '
+                    'IV %{customdata[6]:.1f}% -> Composite %{customdata[7]:.1f}%'
+                    '<extra></extra>'
+                ),
+                customdata=list(zip(
+                    price_lows, price_highs, exp_rets, prob_ups,
+                    [v*100 for v in vol_garchs], [v*100 for v in vol_atrs],
+                    [v*100 for v in vol_ivs], [v*100 for v in vol_composites]
+                )),
             ), row=5, col=1)
-            fig.add_hline(y=0, line_dash='dash',
-                          line_color='rgba(255,255,255,0.3)', row=5, col=1)
-            fig.update_yaxes(title_text='Expected Return %', row=5, col=1)
 
-        # ── Panel 10: Performance Summary Table ──────────────────────────
+            # Composite vol line on secondary axis (overlaid)
+            fig.add_trace(go.Scatter(
+                x=labels, y=[v*100 for v in vol_composites],
+                mode='lines+markers',
+                name='Composite Vol %',
+                line=dict(color=COLORS['purple'], width=2, dash='dot'),
+                marker=dict(size=6, color=COLORS['purple']),
+                yaxis='y9',
+                showlegend=False,
+                hovertemplate='%{x}: %{y:.1f}% composite vol<extra></extra>',
+            ), row=5, col=1)
+
+            # Current price reference line
+            if current_price > 0:
+                fig.add_hline(
+                    y=current_price, line_dash='dash',
+                    line_color=COLORS['amber'],
+                    annotation_text=f'Current: ${current_price:.2f}',
+                    annotation_font_color=COLORS['amber'],
+                    row=5, col=1
+                )
+
+            fig.update_yaxes(title_text='WTI Price ($) / Composite Vol (%)', row=5, col=1)
+
+
+        # ── Panel 10: Performance Summary Table ──────────────────────
         r = backtest_result
-        metrics_header = ['Metric', 'Value']
-        metrics_cells = [
-            ['Total Return', 'Buy & Hold Return', 'Sharpe Ratio', 'Annual Return',
-             'Annual Volatility', 'Max Drawdown', 'Win Rate', 'Profit Factor',
-             'Calmar Ratio', 'Trading Days', 'Total Trades'],
-            [f"{r.total_return*100:+.2f}%", f"{r.bnh_return*100:+.2f}%",
-             f"{r.sharpe:.3f}", f"{r.annual_return*100:+.2f}%",
-             f"{r.annual_vol*100:.2f}%", f"{r.max_drawdown*100:.2f}%",
-             f"{r.win_rate*100:.1f}%", f"{r.profit_factor:.2f}",
-             f"{r.calmar_ratio:.2f}", f"{r.trading_days}",
-             f"{r.total_trades}"]
+        metrics_header = ['Metric', 'Value', 'What It Means']
+        metric_rows = [
+            ('Total Return',       f"{r.total_return*100:+.2f}%",   'Overall profit/loss'),
+            ('Buy & Hold Rtn',     f"{r.bnh_return*100:+.2f}%",     'Passive holding benchmark'),
+            ('Sharpe Ratio',       f"{r.sharpe:.3f}",               'Return per unit of risk'),
+            ('Sortino Ratio',      f"{r.sortino:.3f}",              'Downside-risk adjusted'),
+            ('Information Ratio',  f"{r.information_ratio:.3f}",    'Skill vs benchmark'),
+            ('Omega Ratio',        f"{r.omega_ratio:.3f}",          'Total gains / losses'),
+            ('Max Drawdown',       f"{r.max_drawdown*100:.2f}%",    'Worst drop from peak'),
+            ('Calmar Ratio',       f"{r.calmar_ratio:.3f}",         'Return / max drawdown'),
+            ('Sterling Ratio',     f"{r.sterling_ratio:.3f}",       'Return / avg drawdowns'),
+            ('Ulcer Index',        f"{r.ulcer_index:.2f}",          'Drawdown stress score'),
+            ('Win Rate',           f"{r.win_rate*100:.1f}%",        '% of profitable trades'),
+            ('Profit Factor',      f"{r.profit_factor:.3f}",        'Gross gain / gross loss'),
+            ('Expectancy',         f"{r.expectancy*10000:.2f} bps", 'Avg profit per trade'),
+            ('Tail Ratio',         f"{r.tail_ratio:.3f}",           'Big wins vs big losses'),
+            ('Capture Ratio',      f"{r.capture_ratio:.3f}",        'Up capture / down capture'),
+            ('Trading Days',       f"{r.trading_days}",             'Days in backtest'),
+            ('Total Trades',       f"{r.total_trades}",             'Active trading days'),
         ]
+        names = [m[0] for m in metric_rows]
+        vals  = [m[1] for m in metric_rows]
+        descs = [m[2] for m in metric_rows]
 
         # Color-code values
         value_colors = []
-        for val_str in metrics_cells[1]:
-            if '%' in val_str or val_str.replace('.', '').replace('-', '').replace('+', '').isdigit():
-                try:
-                    num = float(val_str.replace('%', '').replace('+', ''))
-                    if 'Drawdown' in metrics_cells[0][len(value_colors)]:
-                        value_colors.append(COLORS['red'])
-                    elif num > 0:
-                        value_colors.append(COLORS['green'])
-                    elif num < 0:
-                        value_colors.append(COLORS['red'])
-                    else:
-                        value_colors.append(COLORS['text'])
-                except (ValueError, IndexError):
+        for i, val_str in enumerate(vals):
+            try:
+                cleaned = val_str.replace('%', '').replace('+', '').replace(',', '').split()[0]
+                num = float(cleaned)
+                if 'Drawdown' in names[i] or 'Ulcer' in names[i]:
+                    value_colors.append(COLORS['red'])
+                elif num > 0:
+                    value_colors.append(COLORS['green'])
+                elif num < 0:
+                    value_colors.append(COLORS['red'])
+                else:
                     value_colors.append(COLORS['text'])
-            else:
+            except (ValueError, IndexError):
                 value_colors.append(COLORS['text'])
 
         fig.add_trace(go.Table(
             header=dict(
                 values=metrics_header,
                 fill_color=COLORS['panel'],
-                font=dict(color=COLORS['white'], size=13),
+                font=dict(color=COLORS['white'], size=12),
                 align='left',
                 line_color=COLORS['grid'],
             ),
             cells=dict(
-                values=metrics_cells,
+                values=[names, vals, descs],
                 fill_color=COLORS['bg'],
                 font=dict(
                     color=[
-                        [COLORS['white']] * len(metrics_cells[0]),
+                        [COLORS['white']] * len(names),
                         value_colors,
+                        [COLORS['text']] * len(names),
                     ],
-                    size=12,
+                    size=11,
                 ),
                 align='left',
                 line_color=COLORS['grid'],
-                height=28,
+                height=24,
             ),
         ), row=5, col=2)
 
         # ── Layout ───────────────────────────────────────────────────────
         fig.update_layout(
             title=dict(
-                text=(f"<b>PETROQUANT — {strategy.name} Dashboard</b>"
+                text=(f"<b>PETROQUANT -- {strategy.name} Dashboard</b>"
                       f"<br><span style='font-size:12px;color:{COLORS['text']}'>"
                       f"Sharpe: {r.sharpe:.2f} | Return: {r.total_return*100:+.1f}% | "
                       f"MaxDD: {r.max_drawdown*100:.1f}% | "
@@ -459,10 +740,10 @@ class StrategyDashboard:
             annotation['font'] = dict(size=13, color=COLORS['white'])
 
         fig.show()
-        print(f"\n  ✓ Dashboard rendered for: {strategy.name}")
+        print(f"\n  [OK] Dashboard rendered for: {strategy.name}")
         return fig
 
     def save_html(self, fig, filepath):
         """Export dashboard to standalone HTML file."""
         fig.write_html(filepath, include_plotlyjs=True)
-        print(f"  ✓ Saved: {filepath}")
+        print(f"  [OK] Saved: {filepath}")

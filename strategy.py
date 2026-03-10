@@ -3,11 +3,11 @@
 # ============================================================================
 # Contains:
 #   BaseStrategy       — abstract base class for all strategies
+#   VolatilityEngine   — GARCH + ATR + OVX composite volatility CI
 #   HMMXGBoostStrategy — HMM regime detection + XGBoost walk-forward
-#   TD0RLStrategy      — Reinforcement learning with TD(0) temporal difference
 #
 # USAGE:
-#   from strategy import HMMXGBoostStrategy, TD0RLStrategy
+#   from strategy import HMMXGBoostStrategy
 #   strat = HMMXGBoostStrategy(fwd_days=5)
 #   result_df = strat.run(master_df)
 #
@@ -21,13 +21,208 @@ import numpy as np
 import pandas as pd
 import warnings
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from hmmlearn.hmm import GaussianHMM
 from xgboost import XGBClassifier, XGBRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 
 warnings.filterwarnings('ignore')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VOLATILITY ENGINE — 3-LAYER COMPOSITE CI
+# ═════════════════════════════════════════════════════════════════════════════
+class VolatilityEngine:
+    """
+    Computes horizon-aware 95% CI using 3 volatility layers:
+      1. GARCH(1,1) — conditional volatility with mean-reversion
+      2. ATR(14)     — gap-aware, price-action-sensitive noise floor
+      3. OVX (IV)    — market's own implied volatility (CBOE Oil VIX)
+
+    Blended with horizon-dependent weights:
+      Short (1-7d):   heavier ATR   (price-action sensitive)
+      Medium (15-30d): heavier GARCH (clustering + mean-reversion)
+      Long (60-180d):  heavier IV    (market's forward view)
+    """
+
+    # Horizon-dependent blend weights: {horizon: (w_garch, w_atr, w_iv)}
+    BLEND_WEIGHTS = {
+        1:   (0.25, 0.50, 0.25),
+        7:   (0.30, 0.40, 0.30),
+        15:  (0.40, 0.25, 0.35),
+        30:  (0.40, 0.20, 0.40),
+        60:  (0.30, 0.15, 0.55),
+        90:  (0.25, 0.10, 0.65),
+        180: (0.20, 0.10, 0.70),
+    }
+
+    def __init__(self, prices, ovx_series=None, lookback=252):
+        """
+        Parameters
+        ----------
+        prices    : pd.Series of daily close prices (WTI_Close)
+        ovx_series: pd.Series of OVX values (optional, from pipeline)
+        lookback  : int, number of days for GARCH fitting
+        """
+        self.prices = prices.dropna()
+        self.ovx = ovx_series
+        self.lookback = lookback
+
+        # Pre-compute layers
+        self._fit_garch()
+        self._compute_atr()
+        self._compute_iv()
+
+    # ── Layer 1: GARCH(1,1) ──────────────────────────────────────────
+    def _fit_garch(self):
+        """Fit GARCH(1,1) on recent daily log-returns."""
+        from arch import arch_model
+
+        log_ret = np.log(self.prices / self.prices.shift(1)).dropna()
+        recent = log_ret.tail(self.lookback) * 100  # arch expects percent returns
+
+        try:
+            model = arch_model(recent, vol='Garch', p=1, q=1, mean='Zero',
+                               rescale=False)
+            res = model.fit(disp='off', show_warning=False)
+
+            # Extract GARCH parameters
+            self.omega = res.params.get('omega', 0.01)
+            self.alpha = res.params.get('alpha[1]', 0.05)
+            self.beta  = res.params.get('beta[1]', 0.90)
+            # Last conditional variance (in %^2)
+            self.sigma2_1 = float(res.conditional_volatility.iloc[-1] ** 2)
+            self.garch_fitted = True
+            # Long-run variance
+            persist = self.alpha + self.beta
+            if persist < 1.0:
+                self.sigma2_lr = self.omega / (1.0 - persist)
+            else:
+                self.sigma2_lr = self.sigma2_1
+        except Exception:
+            # Fallback to simple realized vol
+            daily_vol = log_ret.tail(60).std()
+            self.sigma2_1 = (daily_vol * 100) ** 2
+            self.sigma2_lr = self.sigma2_1
+            self.alpha = 0.05
+            self.beta = 0.90
+            self.omega = self.sigma2_lr * 0.05
+            self.garch_fitted = False
+
+    def _garch_horizon_vol(self, horizon):
+        """
+        GARCH h-step ahead annualized volatility (in decimal, not %).
+        σ²(h) = h·σ²_lr + (α+β)·[(1-(α+β)^h)/(1-(α+β))]·(σ²₁ - σ²_lr)
+        """
+        persist = self.alpha + self.beta
+        if abs(persist - 1.0) < 1e-6:
+            # Unit-root IGARCH: variance scales linearly
+            total_var = self.sigma2_1 * horizon
+        else:
+            # Mean-reverting GARCH variance forecast
+            total_var = (horizon * self.sigma2_lr +
+                         persist * (1 - persist**horizon) / (1 - persist) *
+                         (self.sigma2_1 - self.sigma2_lr))
+        # Convert from %^2 to decimal
+        return np.sqrt(max(total_var, 1e-8)) / 100.0
+
+    # ── Layer 2: ATR(14) ─────────────────────────────────────────────
+    def _compute_atr(self):
+        """Compute 14-day ATR using daily close-to-close as proxy for True Range."""
+        close = self.prices
+        # True Range proxy: use daily absolute return * close (no High/Low available)
+        daily_abs_change = (close - close.shift(1)).abs()
+        # EMA smoothing (14-day)
+        self.atr_14 = float(daily_abs_change.ewm(span=14, adjust=False).mean().iloc[-1])
+        self.current_price = float(close.iloc[-1])
+
+    def _atr_horizon_vol(self, horizon):
+        """
+        ATR-based volatility scaled to horizon.
+        Uses sqrt(h) scaling with a decay factor to prevent long-horizon explosion.
+        Returns annualized-style volatility as decimal fraction of price.
+        """
+        # ATR as fraction of price
+        atr_frac = self.atr_14 / self.current_price
+        # Scale: sqrt(h) with decay factor 0.9^(h/5)
+        decay = 0.9 ** (horizon / 5.0)
+        return atr_frac * np.sqrt(horizon) * decay
+
+    # ── Layer 3: OVX Implied Volatility ──────────────────────────────
+    def _compute_iv(self):
+        """Get the latest OVX value (annualized implied vol for crude oil)."""
+        if self.ovx is not None and len(self.ovx.dropna()) > 0:
+            self.ovx_latest = float(self.ovx.dropna().iloc[-1])
+        else:
+            self.ovx_latest = None
+
+    def _iv_horizon_vol(self, horizon):
+        """
+        OVX-based volatility scaled to horizon.
+        OVX is annualized → σ_iv(h) = (OVX/100) * sqrt(h/252)
+        """
+        if self.ovx_latest is None:
+            return None
+        return (self.ovx_latest / 100.0) * np.sqrt(horizon / 252.0)
+
+    # ── Composite Blending ───────────────────────────────────────────
+    def compute_ci(self, horizon, expected_return):
+        """
+        Compute 95% CI for a given horizon.
+
+        Returns
+        -------
+        dict with: ci_lower, ci_upper, price_target, vol_garch, vol_atr,
+                   vol_iv, vol_composite, current_price
+        """
+        vol_garch = self._garch_horizon_vol(horizon)
+        vol_atr   = self._atr_horizon_vol(horizon)
+        vol_iv    = self._iv_horizon_vol(horizon)
+
+        # Get blend weights (fall back to equal if horizon not in map)
+        w_g, w_a, w_i = self.BLEND_WEIGHTS.get(horizon, (0.33, 0.33, 0.34))
+
+        # If IV unavailable, redistribute its weight to GARCH and ATR
+        if vol_iv is None:
+            total = w_g + w_a
+            w_g, w_a, w_i = w_g / total, w_a / total, 0.0
+            vol_iv_val = 0.0
+        else:
+            vol_iv_val = vol_iv
+
+        vol_composite = w_g * vol_garch + w_a * vol_atr + w_i * vol_iv_val
+
+        price_target = self.current_price * (1 + expected_return)
+        ci_lower = self.current_price * (1 + expected_return - 1.96 * vol_composite)
+        ci_upper = self.current_price * (1 + expected_return + 1.96 * vol_composite)
+
+        return {
+            'ci_lower': float(ci_lower),
+            'ci_upper': float(ci_upper),
+            'price_target': float(price_target),
+            'vol_garch': float(vol_garch),
+            'vol_atr': float(vol_atr),
+            'vol_iv': float(vol_iv_val) if vol_iv is not None else None,
+            'vol_composite': float(vol_composite),
+            'current_price': float(self.current_price),
+        }
+
+    def print_summary(self):
+        """Print a summary of the volatility engine state."""
+        garch_status = "[OK] GARCH(1,1) fitted" if self.garch_fitted else "[WARN] GARCH fallback (realized vol)"
+        print(f"    {garch_status}")
+        print(f"      alpha={self.alpha:.4f}  beta={self.beta:.4f}  "
+              f"persistence={self.alpha+self.beta:.4f}")
+        print(f"      1-day cond. vol = {np.sqrt(self.sigma2_1)/100:.4f} "
+              f"({np.sqrt(self.sigma2_1):.2f}%)")
+
+        print(f"    [OK] ATR(14) = ${self.atr_14:.2f} "
+              f"({self.atr_14/self.current_price*100:.2f}% of price)")
+
+        if self.ovx_latest is not None:
+            print(f"    [OK] OVX (Implied Vol) = {self.ovx_latest:.1f}% annualized")
+        else:
+            print(f"    [WARN] OVX not available -- using GARCH + ATR only")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -56,7 +251,7 @@ class BaseStrategy(ABC):
         pass
 
     def run(self, master_df):
-        """Full pipeline: features → fit/predict → forecast → return enriched df."""
+        """Full pipeline: features -> fit/predict -> forecast -> return enriched df."""
         print(f"\n{'='*70}")
         print(f"  RUNNING STRATEGY: {self.name}")
         print(f"{'='*70}\n")
@@ -66,7 +261,7 @@ class BaseStrategy(ABC):
         feat_df = self.forecast_returns(feat_df)
 
         print(f"\n{'='*70}")
-        print(f"  ✓ {self.name} COMPLETE — {len(feat_df)} rows with signals")
+        print(f"  [OK] {self.name} COMPLETE -- {len(feat_df)} rows with signals")
         print(f"{'='*70}\n")
         return feat_df
 
@@ -113,6 +308,7 @@ class HMMXGBoostStrategy(BaseStrategy):
     # ── STEP 1: FEATURE ENGINEERING ──────────────────────────────────────
     def engineer_features(self, master_df):
         print("  [1/4] Engineering features...")
+        print("         (Transforming raw market data into patterns the AI can learn from)")
         feat = master_df.copy()
 
         COL_CRUDE = self._resolve_col(feat, 'Crude_Stocks_1000bbl', ['Crude_Stocks_1000bb1'])
@@ -179,8 +375,10 @@ class HMMXGBoostStrategy(BaseStrategy):
         raw_cols = ['WTI_Close', 'Brent_Close', 'OVX', 'USD_Index', 'Crack_3_2_1',
                     'Net_Speculative_Position', COL_CRUDE, 'US_Oil_Rigs', COL_SPR, 'Spread']
         engineered = [c for c in feat.columns if c not in raw_cols]
-        print(f"    ✓ {len(engineered)} engineered features from {len(raw_cols)} raw variables")
-        print(f"    ✓ Clean DataFrame: {feat.shape[0]} rows × {feat.shape[1]} cols")
+        print(f"    [OK] {len(engineered)} engineered features from {len(raw_cols)} raw variables")
+        print(f"      (e.g., 'WTI_LogRet_1d' = how much oil price changed today in %)")
+        print(f"    [OK] Clean DataFrame: {feat.shape[0]} rows x {feat.shape[1]} cols")
+        print(f"      (Each row = one trading day, each column = one data signal)")
 
         return feat
 
@@ -190,6 +388,7 @@ class HMMXGBoostStrategy(BaseStrategy):
 
         # ── HMM Regime Detection ─────────────────────────────────────────
         print("  [2/4] Fitting HMM regime detection...")
+        print("         (Detecting the market's 'mood' -- is it calm, choppy, or panicking?)")
         X_hmm = feat[['WTI_LogRet_1d', 'RealizedVol_20d']].values
         scaler_hmm = StandardScaler()
         X_hmm_scaled = scaler_hmm.fit_transform(X_hmm)
@@ -228,13 +427,22 @@ class HMMXGBoostStrategy(BaseStrategy):
         self.regime_map = regime_map
         self.regime_stats = state_stats
 
-        print(f"    ✓ HMM converged — Log-likelihood: {hmm_model.score(X_hmm_scaled):.2f}")
+        print(f"    [OK] HMM converged -- Log-likelihood: {hmm_model.score(X_hmm_scaled):.2f}")
+        print(f"      (The model successfully learned 3 market moods from price patterns)")
+        print()
+        print(f"      {'Regime':<10} {'Avg Daily Return':>18} {'Avg Volatility':>16} {'Days':>12}")
+        print(f"      {'─'*60}")
         for _, row in state_stats.iterrows():
             s = int(row['State'])
             name = regime_map[s]
             pct = row['Count'] / len(feat) * 100
-            print(f"      State {s} → {name:7s} | ret={row['Mean_Return']:+.5f} "
-                  f"vol={row['Mean_Vol']:.4f} | {int(row['Count'])} days ({pct:.1f}%)")
+            marker = {'BULL': '[+]', 'CHOPPY': '[~]', 'PANIC': '[!]'}.get(name, '[ ]')
+            print(f"      {marker} {name:7s}   {row['Mean_Return']:+.5f} ({row['Mean_Return']*25200:+.1f}%/yr)"
+                  f"    {row['Mean_Vol']:.4f}         "
+                  f"{int(row['Count'])} days ({pct:.1f}%)")
+        print()
+        print(f"      * BULL = calm market trending up | CHOPPY = uncertain sideways")
+        print(f"        PANIC = high fear, big swings (think COVID crash or oil war)")
 
         # ── Target ───────────────────────────────────────────────────────
         fwd_ret = feat['WTI_Close'].shift(-self.fwd_days) / feat['WTI_Close'] - 1
@@ -256,6 +464,8 @@ class HMMXGBoostStrategy(BaseStrategy):
         # ── Walk-Forward XGBoost ─────────────────────────────────────────
         print(f"  [3/4] Walk-forward XGBoost ({len(self.feature_cols)} features, "
               f"{self.fwd_days}-day target)...")
+        print(f"         (Training an AI on past data, then testing on unseen future data)")
+        print(f"         (Retrains every {self.retrain_every} days to adapt to changing markets)")
 
         X = feat[self.feature_cols].values
         y = feat['Target'].values
@@ -294,7 +504,7 @@ class HMMXGBoostStrategy(BaseStrategy):
             self.fold_metrics.append({
                 'fold': len(self.fold_metrics) + 1,
                 'train': i, 'test': end - i,
-                'period': f"{dates[i].date()} → {dates[end-1].date()}",
+                'period': f"{dates[i].date()} -> {dates[end-1].date()}",
                 'acc': acc
             })
             i = end
@@ -307,25 +517,54 @@ class HMMXGBoostStrategy(BaseStrategy):
             xgb_model.feature_importances_, index=self.feature_cols
         ).sort_values(ascending=False)
 
-        # ── Signals ──────────────────────────────────────────────────────
+        # ── Signals + Regime-Aware Position Sizing ────────────────────────
         mask = feat['Probability'].notna()
         feat['Signal'] = 0
         feat.loc[mask & (feat['Probability'] > self.buy_threshold), 'Signal'] = 1
         feat.loc[mask & (feat['Probability'] < self.sell_threshold), 'Signal'] = -1
         feat['Signal_Label'] = feat['Signal'].map({1: 'BUY', -1: 'SELL', 0: 'HOLD'})
 
+        # Position sizing: scale by regime stability AND model confidence
+        #   BULL  = calm, high conviction trades get full size
+        #   CHOPPY = uncertain, reduce size to 50%
+        #   PANIC  = volatile, reduce size to 25% (protect capital)
+        regime_mult = {'BULL': 1.0, 'CHOPPY': 0.5, 'PANIC': 0.25}
+        feat['Regime_Mult'] = feat['Regime'].map(regime_mult).fillna(0.5)
+
+        # Confidence factor: higher probability distance from 0.5 = more conviction
+        feat['Confidence_Factor'] = np.where(
+            feat['Probability'].notna(),
+            0.5 + 0.5 * (np.abs(feat['Probability'] - 0.5) * 2),  # scales 0.5-1.0
+            0.0
+        )
+
+        # Final position size = signal direction * regime * confidence
+        feat['Position_Size'] = feat['Signal'] * feat['Regime_Mult'] * feat['Confidence_Factor']
+
         fold_df = pd.DataFrame(self.fold_metrics)
         avg_acc = fold_df['acc'].mean()
-        print(f"    ✓ {len(fold_df)} folds | Avg OOS accuracy: {avg_acc:.1%}")
+        print(f"    [OK] {len(fold_df)} folds | Avg OOS accuracy: {avg_acc:.1%}")
+        print(f"      (Out-of-sample = tested on data the model never saw during training)")
+        acc_grade = 'EXCELLENT' if avg_acc > 0.58 else 'GOOD' if avg_acc > 0.54 else 'FAIR' if avg_acc > 0.50 else 'WEAK'
+        print(f"      ({acc_grade}: >50% means the model is better than a coin flip)")
 
         oos = feat[mask]
         n_buy  = (oos['Signal'] == 1).sum()
         n_sell = (oos['Signal'] == -1).sum()
         n_hold = (oos['Signal'] == 0).sum()
         total  = len(oos)
-        print(f"    ✓ Signals: BUY={n_buy} ({n_buy/total*100:.1f}%) | "
+        print(f"    [OK] Signals: BUY={n_buy} ({n_buy/total*100:.1f}%) | "
               f"SELL={n_sell} ({n_sell/total*100:.1f}%) | "
               f"HOLD={n_hold} ({n_hold/total*100:.1f}%)")
+        print(f"      (BUY = model thinks price goes up | SELL = down | HOLD = not sure enough)")
+        print(f"      (Threshold: BUY when Confidence > {self.buy_threshold:.0%}, "
+              f"SELL when < {self.sell_threshold:.0%})")
+
+        # Position sizing summary
+        avg_pos = oos['Position_Size'].abs().mean()
+        print(f"    [OK] Regime-Aware Position Sizing active")
+        print(f"      Avg position size: {avg_pos:.2f} (1.0 = full, 0.25 = quarter)")
+        print(f"      (Sized down in PANIC/CHOPPY regimes, sized up in BULL with high confidence)")
 
         self.metadata.update({
             'avg_accuracy': avg_acc,
@@ -333,31 +572,53 @@ class HMMXGBoostStrategy(BaseStrategy):
             'n_features': len(self.feature_cols),
             'fwd_days': self.fwd_days,
             'has_regimes': True,
+            'position_sizing': 'regime_aware',
         })
 
         return feat
 
-    # ── STEP 4: MULTI-HORIZON FORECASTING ────────────────────────────────
+    # ── STEP 4: MULTI-HORIZON FORECASTING WITH VOLATILITY ENGINE ─────────
     def forecast_returns(self, feat_df):
         print(f"  [4/4] Multi-horizon return forecasting ({self.forecast_horizons})...")
+        print(f"         (Predicting where WTI price will be in 1 day to 6 months)")
+        print(f"         (Uses GARCH + ATR + OVX composite volatility for 95% CI)")
         feat = feat_df.copy()
 
         if not self.feature_cols:
-            print("    ⚠ No feature columns — skipping forecasts")
+            print("    [WARN] No feature columns -- skipping forecasts")
             return feat
 
         X_all = feat[self.feature_cols].values
         scaler = StandardScaler()
         forecasts = {}
 
+        # ── Initialize Volatility Engine ─────────────────────────────────
+        ovx_series = feat['OVX'] if 'OVX' in feat.columns else None
+        vol_engine = VolatilityEngine(
+            prices=feat['WTI_Close'],
+            ovx_series=ovx_series,
+            lookback=252
+        )
+
+        current_price = float(feat['WTI_Close'].iloc[-1])
+
+        print()
+        print(f"    Current WTI Price: ${current_price:.2f}")
+        print()
+        print(f"    -- Volatility Engine Layers --")
+        vol_engine.print_summary()
+        print()
+        print(f"    {'Horizon':<10} {'Price Range (95% CI)':<28} {'Expected':<14} "
+              f"{'Return':<12} {'Vol(G/A/I->C)':<28} {'Confidence':<14} {'View'}")
+        print(f"    {'─'*120}")
+
         for horizon in self.forecast_horizons:
             # Build target: forward return for this horizon
             fwd = feat['WTI_Close'].shift(-horizon) / feat['WTI_Close'] - 1
             valid_mask = fwd.notna()
-            valid_idx = feat.index[valid_mask]
 
             if valid_mask.sum() < self.initial_train_days + 50:
-                print(f"    ⚠ {horizon}d — not enough data, skipping")
+                print(f"    [WARN] {horizon}d -- not enough data, skipping")
                 continue
 
             X_h = X_all[valid_mask]
@@ -392,527 +653,46 @@ class HMMXGBoostStrategy(BaseStrategy):
             reg.fit(X_train_s, y_ret[:train_n])
             exp_return = float(reg.predict(X_last_s)[0])
 
+            # ── Compute volatility-aware CI ──────────────────────────────
+            ci = vol_engine.compute_ci(horizon, exp_return)
+
             forecasts[horizon] = {
                 'prob_up': float(prob_up),
                 'expected_return': exp_return,
+                'expected_price': ci['price_target'],
+                'current_price': ci['current_price'],
+                'price_low': ci['ci_lower'],
+                'price_high': ci['ci_upper'],
+                'vol_garch': ci['vol_garch'],
+                'vol_atr': ci['vol_atr'],
+                'vol_iv': ci['vol_iv'],
+                'vol_composite': ci['vol_composite'],
             }
-            direction = "▲" if prob_up > 0.5 else "▼"
-            print(f"    ✓ {horizon:3d}d → P(up)={prob_up:.1%} | "
-                  f"E[ret]={exp_return:+.2%} {direction}")
 
-        self.metadata['forecasts'] = forecasts
-        return feat
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TD(0) REINFORCEMENT LEARNING STRATEGY — SEMI-GRADIENT WITH LINEAR FA
-# ═════════════════════════════════════════════════════════════════════════════
-class TD0RLStrategy(BaseStrategy):
-    """
-    Advanced trading strategy using Semi-Gradient TD(0) with Linear
-    Function Approximation.
-
-    Key improvements over basic tabular TD:
-    - Linear Q(s,a) = w_a · φ(s) instead of lookup table
-    - 12 continuous state features (no crude binning)
-    - Differential Sharpe Ratio reward (Moody & Saffell 1998)
-    - Softmax/Boltzmann exploration with temperature decay
-    - Risk-sensitive reward with drawdown penalty
-    - 5 training epochs on initial window
-    - Walk-forward online learning
-    """
-
-    ACTIONS = [1, 0, -1]  # BUY, HOLD, SELL
-
-    def __init__(self, alpha=0.005, gamma=0.99, tau_start=1.0,
-                 tau_end=0.1, transaction_cost=0.0005,
-                 initial_train_days=400, retrain_every=63,
-                 n_epochs=5, drawdown_penalty=2.0, eta=0.01):
-        super().__init__(name="TD(0) Reinforcement Learning")
-        self.alpha = alpha                  # learning rate
-        self.gamma = gamma                  # discount factor
-        self.tau_start = tau_start          # softmax temperature start
-        self.tau_end = tau_end              # softmax temperature end
-        self.transaction_cost = transaction_cost
-        self.initial_train_days = initial_train_days
-        self.retrain_every = retrain_every
-        self.n_epochs = n_epochs            # training epochs on initial data
-        self.drawdown_penalty = drawdown_penalty
-        self.eta = eta                      # differential Sharpe EMA decay
-
-        # Weight vectors: one per action → w[action] is a numpy array
-        self.n_features = 0
-        self.weights = {}                   # action → weight vector
-        self.feature_names = []
-        self.feature_importance = None
-        self.feature_cols = []
-        self.fold_metrics = []
-        self.forecast_horizons = [1, 7, 15, 30, 60, 90, 180]
-
-        # Running stats for differential Sharpe
-        self._A = 0.0   # EMA of returns
-        self._B = 0.0   # EMA of squared returns
-
-    # ── STATE FEATURE VECTOR ─────────────────────────────────────────────
-    def _build_state_features(self, feat_df):
-        """
-        Build continuous state feature matrix from the DataFrame.
-        All features are normalized to roughly [-1, 1] using rolling z-scores.
-        """
-        sf = pd.DataFrame(index=feat_df.index)
-
-        # 1. Multi-timeframe momentum
-        sf['mom_5d']  = feat_df['WTI_Close'].pct_change(5)
-        sf['mom_10d'] = feat_df['WTI_Close'].pct_change(10)
-        sf['mom_20d'] = feat_df['WTI_Close'].pct_change(20)
-        sf['mom_60d'] = feat_df['WTI_Close'].pct_change(60)
-
-        # 2. Trend strength: price vs moving averages
-        ma20 = feat_df['WTI_Close'].rolling(20).mean()
-        ma50 = feat_df['WTI_Close'].rolling(50).mean()
-        sf['trend_20'] = (feat_df['WTI_Close'] - ma20) / (ma20 + 1e-8)
-        sf['trend_50'] = (feat_df['WTI_Close'] - ma50) / (ma50 + 1e-8)
-
-        # 3. RSI (14-day)
-        delta = feat_df['WTI_Close'].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / (loss + 1e-8)
-        sf['rsi_14'] = (rs / (1 + rs)) - 0.5  # center around 0, range [-0.5, 0.5]
-
-        # 4. Volatility features
-        log_ret = np.log(feat_df['WTI_Close'] / feat_df['WTI_Close'].shift(1))
-        rv_10 = log_ret.rolling(10).std() * np.sqrt(252)
-        rv_20 = log_ret.rolling(20).std() * np.sqrt(252)
-        rv_60 = log_ret.rolling(60).std() * np.sqrt(252)
-        sf['vol_ratio'] = rv_10 / (rv_60 + 1e-8) - 1  # vol expansion/contraction
-
-        # 5. Spread z-score (WTI-Brent)
-        spread = feat_df['WTI_Close'] - feat_df['Brent_Close']
-        sp_mu  = spread.rolling(20).mean()
-        sp_sig = spread.rolling(20).std()
-        sf['spread_z'] = (spread - sp_mu) / (sp_sig + 1e-8)
-
-        # 6. OVX change (implied vol sentiment)
-        if 'OVX' in feat_df.columns:
-            ovx_mu  = feat_df['OVX'].rolling(20).mean()
-            ovx_sig = feat_df['OVX'].rolling(20).std()
-            sf['ovx_z'] = (feat_df['OVX'] - ovx_mu) / (ovx_sig + 1e-8)
-        else:
-            sf['ovx_z'] = 0.0
-
-        # 7. USD strength
-        if 'USD_Index' in feat_df.columns:
-            usd_mu  = feat_df['USD_Index'].rolling(20).mean()
-            usd_sig = feat_df['USD_Index'].rolling(20).std()
-            sf['usd_z'] = (feat_df['USD_Index'] - usd_mu) / (usd_sig + 1e-8)
-        else:
-            sf['usd_z'] = 0.0
-
-        # 8. Net speculative position z-score
-        if 'Net_Speculative_Position' in feat_df.columns:
-            nsp_mu  = feat_df['Net_Speculative_Position'].rolling(20).mean()
-            nsp_sig = feat_df['Net_Speculative_Position'].rolling(20).std()
-            sf['nsp_z'] = (feat_df['Net_Speculative_Position'] - nsp_mu) / (nsp_sig + 1e-8)
-        else:
-            sf['nsp_z'] = 0.0
-
-        # Clean
-        sf = sf.replace([np.inf, -np.inf], np.nan)
-
-        self.feature_names = list(sf.columns)
-        return sf
-
-    def _get_phi(self, state_features_row, position):
-        """
-        Build feature vector φ(s) for function approximation.
-        Includes raw features + position encoding + interaction terms.
-        """
-        raw = state_features_row.values.astype(float)
-
-        # Position encoding
-        pos_enc = np.array([position, float(position == 1), float(position == -1)])
-
-        # Interaction: momentum × position (captures if aligned)
-        mom_pos = np.array([raw[1] * position])  # mom_10d × position
-
-        phi = np.concatenate([raw, pos_enc, mom_pos, [1.0]])  # +1 bias
-        return np.nan_to_num(phi, nan=0.0)
-
-    def _q_value(self, phi, action):
-        """Compute Q(s,a) = w_a · φ(s)."""
-        return float(np.dot(self.weights[action], phi))
-
-    def _softmax_policy(self, phi, tau):
-        """Softmax/Boltzmann action selection."""
-        q_vals = np.array([self._q_value(phi, a) for a in self.ACTIONS])
-
-        # Numerical stability
-        q_vals = q_vals - q_vals.max()
-        exp_q = np.exp(q_vals / max(tau, 0.01))
-        probs = exp_q / (exp_q.sum() + 1e-10)
-
-        return probs
-
-    def _differential_sharpe_reward(self, ret, action, position):
-        """
-        Differential Sharpe Ratio (Moody & Saffell, 1998).
-        Provides a reward that directly optimizes the Sharpe ratio.
-        """
-        R_t = action * ret
-
-        # Transaction cost
-        if action != position:
-            R_t -= self.transaction_cost
-
-        # Update EMAs
-        dA = R_t - self._A
-        dB = R_t ** 2 - self._B
-
-        # Differential Sharpe
-        denom = (self._B - self._A ** 2)
-        if denom > 1e-10:
-            dS = (self._B * dA - 0.5 * self._A * dB) / (denom ** 1.5 + 1e-10)
-        else:
-            dS = R_t  # fallback to simple return when no variance yet
-
-        # Update EMAs
-        self._A += self.eta * dA
-        self._B += self.eta * dB
-
-        return dS
-
-    # ── FEATURE ENGINEERING ──────────────────────────────────────────────
-    def engineer_features(self, master_df):
-        print("  [1/4] Engineering features for RL agent...")
-        feat = master_df.copy()
-
-        # Basic derived features (needed for state building)
-        feat['WTI_LogRet_1d'] = np.log(feat['WTI_Close'] / feat['WTI_Close'].shift(1))
-        feat['WTI_Mom_10']    = feat['WTI_Close'].pct_change(10)
-        feat['WTI_Mom_20']    = feat['WTI_Close'].pct_change(20)
-        feat['RealizedVol_20d'] = feat['WTI_LogRet_1d'].rolling(20).std() * np.sqrt(252)
-
-        feat['Spread'] = feat['WTI_Close'] - feat['Brent_Close']
-        spread_mu  = feat['Spread'].rolling(20).mean()
-        spread_sig = feat['Spread'].rolling(20).std()
-        feat['Spread_Zscore'] = (feat['Spread'] - spread_mu) / (spread_sig + 1e-8)
-
-        if 'OVX' in feat.columns:
-            feat['OVX_Chg_5d'] = feat['OVX'].pct_change(5)
-
-        if 'USD_Index' in feat.columns:
-            feat['USD_Chg_5d'] = feat['USD_Index'].pct_change(5)
-
-        if 'Net_Speculative_Position' in feat.columns:
-            nsp_mu  = feat['Net_Speculative_Position'].rolling(20).mean()
-            nsp_sig = feat['Net_Speculative_Position'].rolling(20).std()
-            feat['NSP_Zscore'] = (feat['Net_Speculative_Position'] - nsp_mu) / (nsp_sig + 1e-8)
-
-        if 'Crack_3_2_1' in feat.columns:
-            crack_mu  = feat['Crack_3_2_1'].rolling(20).mean()
-            crack_sig = feat['Crack_3_2_1'].rolling(20).std()
-            feat['Crack_Zscore'] = (feat['Crack_3_2_1'] - crack_mu) / (crack_sig + 1e-8)
-
-        # Clean
-        feat = feat.replace([np.inf, -np.inf], np.nan).dropna()
-
-        # Drop zero-variance
-        zero_var = [c for c in feat.columns if feat[c].std() == 0]
-        if zero_var:
-            feat = feat.drop(columns=zero_var)
-
-        print(f"    ✓ Clean DataFrame: {feat.shape[0]} rows × {feat.shape[1]} cols")
-        return feat
-
-    # ── TD(0) SEMI-GRADIENT LEARNING ─────────────────────────────────────
-    def fit_predict(self, feat_df):
-        feat = feat_df.copy()
-
-        print("  [2/4] Semi-gradient TD(0) with linear function approximation...")
-
-        # Build state feature matrix
-        state_features = self._build_state_features(feat)
-        print(f"    State features: {len(self.feature_names)} continuous dimensions")
-        print(f"    Features: {self.feature_names}")
-
-        # Daily returns
-        feat['Daily_Return'] = feat['WTI_Close'].pct_change().fillna(0)
-        daily_ret = feat['Daily_Return'].values
-
-        # Phi dimensionality: features + position(3) + interaction(1) + bias(1)
-        sample_phi = self._get_phi(state_features.iloc[self.initial_train_days], 0)
-        self.n_features = len(sample_phi)
-        print(f"    φ(s) dimension: {self.n_features}")
-
-        # Initialize weights with small random values
-        np.random.seed(42)
-        for a in self.ACTIONS:
-            self.weights[a] = np.random.randn(self.n_features) * 0.001
-
-        n = len(feat)
-        signals = np.zeros(n)
-        probabilities = np.full(n, np.nan)
-
-        # ── Phase 1: Train on initial window (multiple epochs) ───────────
-        print(f"    Phase 1: Training {self.n_epochs} epochs on "
-              f"{self.initial_train_days} days...")
-
-        total_updates = 0
-        for epoch in range(self.n_epochs):
-            position = 0
-            self._A = 0.0
-            self._B = 0.0
-            equity = 1.0
-            peak_equity = 1.0
-            epoch_reward = 0.0
-
-            # Decay learning rate across epochs
-            lr = self.alpha * (1.0 / (1.0 + 0.3 * epoch))
-            tau = self.tau_start * (0.7 ** epoch)  # cool temperature each epoch
-
-            for t in range(60, self.initial_train_days):
-                phi = self._get_phi(state_features.iloc[t], position)
-
-                # Softmax action selection
-                probs = self._softmax_policy(phi, tau)
-                action = np.random.choice(self.ACTIONS, p=probs)
-
-                # Differential Sharpe reward
-                reward = self._differential_sharpe_reward(
-                    daily_ret[t], action, position
-                )
-
-                # Drawdown penalty
-                equity *= (1 + action * daily_ret[t])
-                peak_equity = max(peak_equity, equity)
-                dd = (equity - peak_equity) / (peak_equity + 1e-8)
-                if dd < -0.05:  # penalize when drawdown > 5%
-                    reward += self.drawdown_penalty * dd
-
-                epoch_reward += reward
-
-                # Next state
-                if t + 1 < self.initial_train_days:
-                    next_phi = self._get_phi(state_features.iloc[t + 1], action)
-                    next_q_max = max(self._q_value(next_phi, a) for a in self.ACTIONS)
-                else:
-                    next_q_max = 0.0
-
-                # Semi-gradient TD(0) update:
-                # w_a ← w_a + α[r + γ·max_a' Q(s',a') - Q(s,a)] · φ(s)
-                current_q = self._q_value(phi, action)
-                td_error = reward + self.gamma * next_q_max - current_q
-                self.weights[action] += lr * td_error * phi
-
-                # L2 regularization to prevent weight explosion
-                for a in self.ACTIONS:
-                    self.weights[a] *= 0.9999
-
-                position = action
-                total_updates += 1
-
-            avg_r = epoch_reward / (self.initial_train_days - 60)
-            print(f"      Epoch {epoch+1}/{self.n_epochs} | "
-                  f"lr={lr:.4f} τ={tau:.3f} | "
-                  f"avg_reward={avg_r:.6f} | equity={equity:.3f}")
-
-        print(f"    ✓ {total_updates} weight updates completed")
-
-        # ── Phase 2: Walk-forward OOS with online learning ───────────────
-        print(f"    Phase 2: Walk-forward from day {self.initial_train_days}...")
-
-        position = 0
-        self._A = 0.0
-        self._B = 0.0
-        equity = 1.0
-        peak_equity = 1.0
-        self.fold_metrics = []
-
-        # Target for accuracy tracking
-        fwd_ret = feat['WTI_Close'].shift(-5) / feat['WTI_Close'] - 1
-        feat['Target'] = (fwd_ret > 0).astype(int)
-
-        fold_rewards = []
-        fold_start_t = self.initial_train_days
-
-        for t in range(self.initial_train_days, n):
-            phi = self._get_phi(state_features.iloc[t], position)
-
-            # Decay temperature over OOS period
-            progress = (t - self.initial_train_days) / max(n - self.initial_train_days, 1)
-            tau = self.tau_end + (self.tau_start * 0.5 - self.tau_end) * (1 - progress)
-
-            # Softmax action selection
-            probs = self._softmax_policy(phi, tau)
-            action = np.random.choice(self.ACTIONS, p=probs)
-            signals[t] = action
-
-            # Store probability of chosen action as confidence
-            action_idx = self.ACTIONS.index(action)
-            probabilities[t] = probs[0]  # P(buy)
-
-            # Reward & online TD update
-            reward = self._differential_sharpe_reward(
-                daily_ret[t], action, position
-            )
-
-            # Drawdown penalty
-            equity *= (1 + action * daily_ret[t])
-            peak_equity = max(peak_equity, equity)
-            dd = (equity - peak_equity) / (peak_equity + 1e-8)
-            if dd < -0.05:
-                reward += self.drawdown_penalty * dd
-
-            fold_rewards.append(reward)
-
-            # Online TD update (reduced learning rate)
-            online_lr = self.alpha * 0.3
-            if t + 1 < n:
-                next_phi = self._get_phi(state_features.iloc[t + 1], action)
-                next_q_max = max(self._q_value(next_phi, a) for a in self.ACTIONS)
-            else:
-                next_q_max = 0.0
-
-            current_q = self._q_value(phi, action)
-            td_error = reward + self.gamma * next_q_max - current_q
-            self.weights[action] += online_lr * td_error * phi
-
-            for a in self.ACTIONS:
-                self.weights[a] *= 0.9999
-
-            position = action
-
-            # Record fold metrics periodically
-            if (t - fold_start_t + 1) % self.retrain_every == 0 and fold_rewards:
-                fold_avg = np.mean(fold_rewards)
-                self.fold_metrics.append({
-                    'fold': len(self.fold_metrics) + 1,
-                    'train': t, 'test': self.retrain_every,
-                    'period': f"{feat.index[t - self.retrain_every + 1].date()} → "
-                              f"{feat.index[t].date()}",
-                    'acc': float(np.mean([r > 0 for r in fold_rewards[-self.retrain_every:]]))
-                })
-                fold_rewards = []
-
-        feat['Signal'] = signals.astype(int)
-        feat['Signal_Label'] = feat['Signal'].map({1: 'BUY', -1: 'SELL', 0: 'HOLD'})
-        feat['Probability'] = probabilities
-        feat['Prediction'] = np.where(probabilities > 0.5, 1.0, 0.0)
-
-        # NaN before OOS
-        feat.loc[feat.index[:self.initial_train_days], 'Prediction'] = np.nan
-        feat.loc[feat.index[:self.initial_train_days], 'Probability'] = np.nan
-
-        # Regime labeling (by volatility tercile)
-        rv = feat['RealizedVol_20d']
-        q33, q66 = rv.quantile(0.33), rv.quantile(0.66)
-        feat['Regime'] = 'CHOPPY'
-        feat.loc[rv <= q33, 'Regime'] = 'BULL'
-        feat.loc[rv >= q66, 'Regime'] = 'PANIC'
-
-        # ── Feature importance from weight magnitudes ────────────────────
-        avg_weights = sum(np.abs(self.weights[a]) for a in self.ACTIONS) / len(self.ACTIONS)
-
-        # Map weights back to feature names
-        raw_feat_names = self.feature_names.copy()
-        all_names = raw_feat_names + ['position', 'is_long', 'is_short',
-                                       'mom_x_pos', 'bias']
-        importance_dict = {}
-        for i, name in enumerate(all_names):
-            if i < len(avg_weights):
-                importance_dict[name] = float(avg_weights[i])
-
-        self.feature_importance = pd.Series(importance_dict).sort_values(ascending=False)
-        self.feature_cols = list(self.feature_importance.index)
-
-        # ── Summary ──────────────────────────────────────────────────────
-        oos = feat.iloc[self.initial_train_days:]
-        n_buy  = (oos['Signal'] == 1).sum()
-        n_sell = (oos['Signal'] == -1).sum()
-        n_hold = (oos['Signal'] == 0).sum()
-        total  = len(oos)
-
-        fold_df = pd.DataFrame(self.fold_metrics) if self.fold_metrics else pd.DataFrame()
-        avg_acc = fold_df['acc'].mean() if len(fold_df) > 0 else 0
-
-        print(f"\n    ✓ φ(s) dim: {self.n_features} | "
-              f"Weight norms: " + " | ".join(
-                  f"a={a}: {np.linalg.norm(self.weights[a]):.4f}" for a in self.ACTIONS))
-        print(f"    ✓ {len(fold_df)} folds | Avg positive reward rate: {avg_acc:.1%}")
-        print(f"    ✓ Signals: BUY={n_buy} ({n_buy/total*100:.1f}%) | "
-              f"SELL={n_sell} ({n_sell/total*100:.1f}%) | "
-              f"HOLD={n_hold} ({n_hold/total*100:.1f}%)")
-
-        self.metadata.update({
-            'avg_accuracy': avg_acc,
-            'n_features_phi': self.n_features,
-            'weight_norms': {a: float(np.linalg.norm(self.weights[a]))
-                             for a in self.ACTIONS},
-            'has_regimes': True,
-            'fwd_days': 5,
-        })
-
-        return feat
-
-    # ── MULTI-HORIZON FORECASTING ────────────────────────────────────────
-    def forecast_returns(self, feat_df):
-        """
-        Multi-horizon return forecast using the learned RL value function.
-        For each horizon, estimates expected return direction from the current
-        state's Q-values combined with historical conditional returns.
-        """
-        print(f"  [4/4] Multi-horizon return forecasting ({self.forecast_horizons})...")
-        feat = feat_df.copy()
-
-        # Build state features for the last observation
-        state_features = self._build_state_features(feat)
-        last_phi = self._get_phi(state_features.iloc[-1], 0)  # neutral position
-
-        # Q-value based directional confidence
-        q_buy  = self._q_value(last_phi, 1)
-        q_sell = self._q_value(last_phi, -1)
-        q_hold = self._q_value(last_phi, 0)
-        q_total = abs(q_buy) + abs(q_sell) + abs(q_hold) + 1e-8
-        rl_bullish = (q_buy - q_sell) / q_total  # [-1, 1] bias
-
-        forecasts = {}
-        for horizon in self.forecast_horizons:
-            fwd = feat['WTI_Close'].shift(-horizon) / feat['WTI_Close'] - 1
-            valid = fwd.dropna()
-
-            if len(valid) < 200:
-                continue
-
-            # Combine RL signal with historical conditional analysis
-            recent_mom = feat['WTI_Mom_10'].iloc[-1]
-            recent_vol = feat['RealizedVol_20d'].iloc[-1]
-
-            # Historical: similar momentum regime
-            similar = feat['WTI_Mom_10'].between(recent_mom - 0.03, recent_mom + 0.03)
-            hist_fwd = fwd[similar].dropna()
-
-            if len(hist_fwd) > 20:
-                hist_prob_up = float((hist_fwd > 0).mean())
-                hist_exp_ret = float(hist_fwd.mean())
-            else:
-                hist_prob_up = 0.5
-                hist_exp_ret = float(valid.mean())
-
-            # Blend RL confidence with historical
-            rl_prob_up = 0.5 + 0.3 * np.tanh(rl_bullish)  # map to [0.2, 0.8]
-            prob_up = 0.4 * rl_prob_up + 0.6 * hist_prob_up
-
-            # Scale expected return by horizon
-            exp_ret = hist_exp_ret * (1 + 0.2 * np.sign(rl_bullish))
-
-            forecasts[horizon] = {
-                'prob_up': float(np.clip(prob_up, 0.05, 0.95)),
-                'expected_return': float(exp_ret),
-            }
-            direction = "▲" if prob_up > 0.5 else "▼"
-            print(f"    ✓ {horizon:3d}d → P(up)={prob_up:.1%} | "
-                  f"E[ret]={exp_ret:+.2%} {direction}")
+            direction = "^ Bullish" if prob_up > 0.55 else "v Bearish" if prob_up < 0.45 else "- Neutral"
+            conf_label = "HIGH" if abs(prob_up - 0.5) > 0.15 else "MEDIUM" if abs(prob_up - 0.5) > 0.05 else "LOW"
+
+            # Format vol breakdown
+            vg = ci['vol_garch'] * 100
+            va = ci['vol_atr'] * 100
+            vi = ci['vol_iv'] * 100 if ci['vol_iv'] is not None else 0
+            vc = ci['vol_composite'] * 100
+            vol_str = f"{vg:.1f}/{va:.1f}/{vi:.1f}->{vc:.1f}%"
+
+            range_str = f"${ci['ci_lower']:.2f} -- ${ci['ci_upper']:.2f}"
+            pad = max(28 - len(range_str), 0)
+            print(f"    {horizon:3d}d       {range_str}{' '*pad}"
+                  f"${ci['price_target']:<10.2f}    {exp_return:>+8.2%}     "
+                  f"{vol_str:<28s}"
+                  f"{prob_up:.1%} ({conf_label})"
+                  f"{'':>4}{direction}")
+
+        print(f"    {'─'*120}")
+        print(f"    * 95% CI = composite of GARCH(1,1) + ATR(14) + OVX implied vol")
+        print(f"      G=GARCH conditional vol | A=ATR noise floor | I=OVX implied vol | C=Composite blend")
+        print(f"      Short horizons weight ATR heavily, long horizons weight IV heavily")
+        print(f"    * Confidence = model's estimated probability that price goes UP")
+        print(f"      HIGH (>65% or <35%) = strong conviction | LOW (45-55%) = uncertain")
 
         self.metadata['forecasts'] = forecasts
         return feat

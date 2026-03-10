@@ -91,7 +91,7 @@ def build_master_df(years=5, force_refresh=False, save_csv=True):
     master_df : pd.DataFrame with DatetimeIndex
     """
     # END_DATE   = datetime.now()
-    END_DATE = datetime(2025, 12, 31)
+    END_DATE = datetime(2025, 12, 30)
     START_DATE = END_DATE - timedelta(days=365 * years)
 
     # ── Check cache ──────────────────────────────────────────────────────

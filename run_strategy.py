@@ -2,7 +2,7 @@
 # PETROQUANT — STRATEGY RUNNER
 # ============================================================================
 # Single entry point to run any strategy end-to-end:
-#   Data Pipeline → Strategy → Backtest → Dashboard
+#   Data Pipeline -> Strategy -> Backtest -> Dashboard
 #
 # USAGE:
 #   python run_strategy.py
@@ -14,11 +14,17 @@
 import os
 import sys
 
+# Force UTF-8 output so box-drawing characters work on Windows terminals
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8')
+
 # Ensure we can import from the project directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from oil_data_pipeline_new import build_master_df
-from strategy import HMMXGBoostStrategy, TD0RLStrategy
+from strategy import HMMXGBoostStrategy
 from dashboard import Backtester, StrategyDashboard
 
 
@@ -31,15 +37,10 @@ STRATEGIES = {
         'params': {'fwd_days': 5},
         'description': 'HMM + XGBoost Regime-Aware Strategy',
     },
-    'td0_rl': {
-        'class': TD0RLStrategy,
-        'params': {},
-        'description': 'TD(0) Reinforcement Learning Strategy',
-    },
 }
 
 # Which strategies to run (set to None to run all)
-RUN_STRATEGIES = None  # or ['hmm_xgb'] or ['td0_rl'] or ['hmm_xgb', 'td0_rl']
+RUN_STRATEGIES = None  # or ['hmm_xgb']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,25 +49,26 @@ RUN_STRATEGIES = None  # or ['hmm_xgb'] or ['td0_rl'] or ['hmm_xgb', 'td0_rl']
 def main():
     # ── Step 1: Load data from pipeline ──────────────────────────────────
     print("\n" + "=" * 70)
-    print("  PETROQUANT — STRATEGY RUNNER")
+    print("  PETROQUANT -- STRATEGY RUNNER")
     print("=" * 70)
-    print("  Loading data from pipeline...\n")
+    print("  Loading data from pipeline...")
+    print("  (Fetching oil prices, volatility, inventories, and macro data)\n")
 
     master_df = build_master_df(force_refresh=False)
 
     if master_df is None or len(master_df) == 0:
-        print("  ✗ Failed to load data. Run oil_data_pipeline_new.py first.")
+        print("  [FAIL] Failed to load data. Run oil_data_pipeline_new.py first.")
         return
 
-    print(f"\n  ✓ Loaded {len(master_df)} rows × {len(master_df.columns)} cols")
-    print(f"  ✓ Range: {master_df.index.min().date()} → {master_df.index.max().date()}")
+    print(f"\n  [OK] Loaded {len(master_df)} rows x {len(master_df.columns)} cols")
+    print(f"  [OK] Range: {master_df.index.min().date()} -> {master_df.index.max().date()}")
 
     # ── Step 2: Run selected strategies ──────────────────────────────────
     to_run = RUN_STRATEGIES or list(STRATEGIES.keys())
 
     for key in to_run:
         if key not in STRATEGIES:
-            print(f"\n  ⚠ Unknown strategy: {key}")
+            print(f"\n  [WARN] Unknown strategy: {key}")
             continue
 
         config = STRATEGIES[key]
@@ -95,7 +97,8 @@ def main():
         dash.save_html(fig, html_path)
 
     print(f"\n{'='*70}")
-    print("  ✓ ALL STRATEGIES COMPLETE")
+    print("  [OK] ALL STRATEGIES COMPLETE")
+    print("    Check the /output/ folder for your interactive HTML dashboard!")
     print(f"{'='*70}\n")
 
 
